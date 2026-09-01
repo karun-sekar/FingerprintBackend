@@ -1,29 +1,48 @@
 const express = require('express');
 const cors = require('cors');
 const dotenv = require('dotenv');
+const jsforce = require('jsforce');
 const jwt = require('jsonwebtoken');
-const https = require('https');
+const fs = require('fs');
+
+// ======================================================
+// LOAD ENVIRONMENT VARIABLES
+// ======================================================
 
 dotenv.config();
+
+// ======================================================
+// APP CONFIGURATION
+// ======================================================
 
 const app = express();
 
 const PORT = process.env.PORT || 3000;
 
+let connection = null;
+
+// ======================================================
+// MIDDLEWARE
+// ======================================================
+
 app.use(cors());
+
 app.use(express.json());
 
 // ======================================================
-// SALESFORCE CONFIG
+// REQUEST LOGGER
 // ======================================================
 
-let salesforce = {
-  accessToken: null,
-  instanceUrl: null,
-};
+app.use((req, res, next) => {
+  console.log(
+    `${new Date().toISOString()} ${req.method} ${req.originalUrl}`,
+  );
+
+  next();
+});
 
 // ======================================================
-// CONNECT TO SALESFORCE USING JWT
+// SALESFORCE CONNECTION
 // ======================================================
 
 async function connectToSalesforce() {
@@ -32,34 +51,112 @@ async function connectToSalesforce() {
     console.log('Connecting to Salesforce...');
     console.log('======================================');
 
-    if (!process.env.SF_CLIENT_ID) {
-      throw new Error('SF_CLIENT_ID is missing');
-    }
+    // --------------------------------------------------
+    // Validate environment variables
+    // --------------------------------------------------
 
     if (!process.env.SF_USERNAME) {
       throw new Error('SF_USERNAME is missing');
+    }
+
+    if (!process.env.SF_CLIENT_ID) {
+      throw new Error('SF_CLIENT_ID is missing');
     }
 
     if (!process.env.SF_LOGIN_URL) {
       throw new Error('SF_LOGIN_URL is missing');
     }
 
-    if (!process.env.SF_PRIVATE_KEY) {
-      throw new Error('SF_PRIVATE_KEY is missing');
+    // --------------------------------------------------
+    // Load private key
+    // --------------------------------------------------
+
+    let privateKey = null;
+
+    // Direct private key from environment variable
+    if (process.env.SF_PRIVATE_KEY) {
+      console.log(
+        'Using SF_PRIVATE_KEY from environment.',
+      );
+
+      privateKey =
+        process.env.SF_PRIVATE_KEY.replace(
+          /\\n/g,
+          '\n',
+        );
     }
 
-    const privateKey =
-      process.env.SF_PRIVATE_KEY.replace(/\\n/g, '\n');
+    // Private key from file
+    else if (process.env.SF_PRIVATE_KEY_PATH) {
+      const keyPath =
+        process.env.SF_PRIVATE_KEY_PATH;
 
-    const payload = {
+      console.log(
+        'Using private key file:',
+        keyPath,
+      );
+
+      if (!fs.existsSync(keyPath)) {
+        throw new Error(
+          `Private key file not found: ${keyPath}`,
+        );
+      }
+
+      privateKey = fs.readFileSync(
+        keyPath,
+        'utf8',
+      );
+    }
+
+    // No private key
+    else {
+      throw new Error(
+        'Neither SF_PRIVATE_KEY nor SF_PRIVATE_KEY_PATH is configured',
+      );
+    }
+
+    // --------------------------------------------------
+    // Validate private key
+    // --------------------------------------------------
+
+    if (!privateKey) {
+      throw new Error(
+        'Private key could not be loaded',
+      );
+    }
+
+    if (
+      !privateKey.includes('BEGIN PRIVATE KEY') &&
+      !privateKey.includes('BEGIN RSA PRIVATE KEY')
+    ) {
+      throw new Error(
+        'The configured key is not a valid private key',
+      );
+    }
+
+    console.log(
+      'Private key loaded successfully.',
+    );
+
+    // --------------------------------------------------
+    // Create JWT payload
+    // --------------------------------------------------
+
+    const tokenPayload = {
       iss: process.env.SF_CLIENT_ID,
       sub: process.env.SF_USERNAME,
       aud: process.env.SF_LOGIN_URL,
-      exp: Math.floor(Date.now() / 1000) + 180,
+      exp:
+        Math.floor(Date.now() / 1000) +
+        180,
     };
 
+    // --------------------------------------------------
+    // Sign JWT
+    // --------------------------------------------------
+
     const assertion = jwt.sign(
-      payload,
+      tokenPayload,
       privateKey,
       {
         algorithm: 'RS256',
@@ -70,63 +167,103 @@ async function connectToSalesforce() {
       'JWT assertion created successfully.',
     );
 
-    const tokenUrl =
-      `${process.env.SF_LOGIN_URL}/services/oauth2/token`;
+    // --------------------------------------------------
+    // Request Salesforce access token
+    // --------------------------------------------------
 
     console.log(
       'Requesting Salesforce access token...',
     );
 
-    const response = await fetch(
-      tokenUrl,
+    const tokenResponse = await fetch(
+      `${process.env.SF_LOGIN_URL}/services/oauth2/token`,
       {
         method: 'POST',
+
         headers: {
           'Content-Type':
             'application/x-www-form-urlencoded',
         },
-        body:
-          `grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer` +
-          `&assertion=${encodeURIComponent(assertion)}`,
+
+        body: new URLSearchParams({
+          grant_type:
+            'urn:ietf:params:oauth:grant-type:jwt-bearer',
+
+          assertion,
+        }).toString(),
       },
     );
 
-    const data = await response.json();
+    const tokenText =
+      await tokenResponse.text();
+
+    let tokenData;
+
+    try {
+      tokenData =
+        JSON.parse(tokenText);
+    } catch (parseError) {
+      console.error(
+        'Salesforce returned non-JSON response:',
+        tokenText,
+      );
+
+      throw new Error(
+        'Salesforce returned an invalid authentication response',
+      );
+    }
 
     console.log(
       'Salesforce token response:',
       {
-        success: response.ok,
+        success: tokenResponse.ok,
         hasAccessToken:
-          !!data.access_token,
+          !!tokenData.access_token,
         instanceUrl:
-          data.instance_url,
+          tokenData.instance_url,
         error:
-          data.error,
+          tokenData.error,
         errorDescription:
-          data.error_description,
+          tokenData.error_description,
       },
     );
 
-    if (!response.ok) {
+    // --------------------------------------------------
+    // Check authentication response
+    // --------------------------------------------------
+
+    if (!tokenResponse.ok) {
       throw new Error(
-        data.error_description ||
-          data.error ||
+        tokenData.error_description ||
+          tokenData.error ||
           'Salesforce authentication failed',
       );
     }
 
-    if (!data.access_token) {
+    if (!tokenData.access_token) {
       throw new Error(
         'Salesforce did not return an access token',
       );
     }
 
-    salesforce.accessToken =
-      data.access_token;
+    if (!tokenData.instance_url) {
+      throw new Error(
+        'Salesforce did not return an instance URL',
+      );
+    }
 
-    salesforce.instanceUrl =
-      data.instance_url;
+    // --------------------------------------------------
+    // Create JSForce connection
+    // --------------------------------------------------
+
+    connection =
+      new jsforce.Connection({
+        instanceUrl:
+          tokenData.instance_url,
+
+        accessToken:
+          tokenData.access_token,
+      });
 
     console.log('======================================');
     console.log(
@@ -136,20 +273,29 @@ async function connectToSalesforce() {
 
     console.log(
       'Instance URL:',
-      salesforce.instanceUrl,
+      tokenData.instance_url,
     );
 
     console.log(
       'Access token received:',
-      !!salesforce.accessToken,
+      !!tokenData.access_token,
     );
 
+    // --------------------------------------------------
     // Test Salesforce REST API
-    const testResponse =
-      await salesforceRequest(
-        'GET',
-        '/services/data/v67.0/limits',
-      );
+    // --------------------------------------------------
+
+    const testResponse = await fetch(
+      `${tokenData.instance_url}/services/data/v67.0/`,
+      {
+        method: 'GET',
+
+        headers: {
+          Authorization:
+            `Bearer ${tokenData.access_token}`,
+        },
+      },
+    );
 
     console.log(
       'Salesforce REST API test status:',
@@ -160,21 +306,35 @@ async function connectToSalesforce() {
       const errorText =
         await testResponse.text();
 
+      let errorData;
+
+      try {
+        errorData =
+          JSON.parse(errorText);
+      } catch {
+        errorData = errorText;
+      }
+
       console.error(
         'Salesforce REST API test failed:',
-        errorText,
+        errorData,
       );
 
       throw new Error(
-        'Salesforce REST API authentication failed',
+        Array.isArray(errorData)
+          ? errorData[0]?.message ||
+              'Salesforce REST API authentication failed'
+          : 'Salesforce REST API authentication failed',
       );
     }
 
     console.log(
       'Salesforce REST API authentication test successful.',
     );
+
+    return true;
   } catch (error) {
-    console.log(
+    console.error(
       '======================================',
     );
 
@@ -184,111 +344,39 @@ async function connectToSalesforce() {
 
     console.error(error);
 
-    console.log(
+    console.error(
       '======================================',
     );
 
-    salesforce.accessToken = null;
-    salesforce.instanceUrl = null;
+    connection = null;
+
+    return false;
   }
 }
 
 // ======================================================
-// SALESFORCE HTTP REQUEST
+// JSON ERROR HELPER
 // ======================================================
 
-function salesforceRequest(
-  method,
-  path,
-  body = null,
+function sendError(
+  res,
+  statusCode,
+  message,
+  error = null,
 ) {
-  return new Promise(
-    (resolve, reject) => {
-      if (
-        !salesforce.accessToken ||
-        !salesforce.instanceUrl
-      ) {
-        return reject(
-          new Error(
-            'Salesforce is not connected',
-          ),
-        );
-      }
+  const response = {
+    success: false,
+    message,
+  };
 
-      const url =
-        new URL(
-          path,
-          salesforce.instanceUrl,
-        );
+  if (error) {
+    response.error =
+      error.message || String(error);
+  }
 
-      const options = {
-        method,
-        hostname: url.hostname,
-        path:
-          url.pathname +
-          url.search,
-        headers: {
-          Authorization:
-            `Bearer ${salesforce.accessToken}`,
-          Accept:
-            'application/json',
-          'Content-Type':
-            'application/json',
-        },
-      };
-
-      const request =
-        https.request(
-          options,
-          response => {
-            let data = '';
-
-            response.on(
-              'data',
-              chunk => {
-                data += chunk;
-              },
-            );
-
-            response.on(
-              'end',
-              () => {
-                resolve({
-                  status:
-                    response.statusCode,
-                  ok:
-                    response.statusCode >= 200 &&
-                    response.statusCode < 300,
-                  text: () => data,
-                  json: () => {
-                    try {
-                      return JSON.parse(data);
-                    } catch {
-                      return {};
-                    }
-                  },
-                });
-              },
-            );
-          },
-        );
-
-      request.on(
-        'error',
-        error => {
-          reject(error);
-        },
-      );
-
-      if (body) {
-        request.write(
-          JSON.stringify(body),
-        );
-      }
-
-      request.end();
-    },
-  );
+  return res
+    .status(statusCode)
+    .json(response);
 }
 
 // ======================================================
@@ -304,21 +392,16 @@ app.get('/', (req, res) => {
 });
 
 // ======================================================
-// HEALTH
+// HEALTH CHECK
 // ======================================================
 
-app.get(
-  '/api/health',
-  async (req, res) => {
-    res.json({
-      success: true,
-      salesforceConnected:
-        !!salesforce.accessToken,
-      instanceUrl:
-        salesforce.instanceUrl,
-    });
-  },
-);
+app.get('/api/health', (req, res) => {
+  res.json({
+    success: true,
+    salesforceConnected:
+      connection !== null,
+  });
+});
 
 // ======================================================
 // GET DEPARTMENTS
@@ -340,17 +423,21 @@ app.get(
     );
 
     try {
-      if (!salesforce.accessToken) {
-        await connectToSalesforce();
+      // ------------------------------------------------
+      // Check connection
+      // ------------------------------------------------
+
+      if (!connection) {
+        return sendError(
+          res,
+          500,
+          'Salesforce is not connected',
+        );
       }
 
-      if (!salesforce.accessToken) {
-        return res.status(500).json({
-          success: false,
-          message:
-            'Salesforce is not connected',
-        });
-      }
+      // ------------------------------------------------
+      // SOQL query
+      // ------------------------------------------------
 
       const query = `
         SELECT
@@ -366,56 +453,93 @@ app.get(
         LIMIT 100
       `;
 
-      const encodedQuery =
-        encodeURIComponent(
-          query.replace(/\s+/g, ' ').trim(),
-        );
+      console.log(
+        'Executing Department SOQL query...',
+      );
 
-      const response =
-        await salesforceRequest(
-          'GET',
-          `/services/data/v67.0/query/?q=${encodedQuery}`,
-        );
+      const result =
+        await connection.query(query);
 
-      const data =
-        await response.json();
+      console.log(
+        'Department query successful.',
+      );
 
-      if (!response.ok) {
-        console.error(
-          'Salesforce GET failed:',
-          data,
-        );
+      console.log(
+        'Total records:',
+        result.totalSize,
+      );
 
-        return res.status(500).json({
-          success: false,
-          message:
-            'Failed to retrieve Department records',
-          error:
-            data[0]?.message ||
-            'Salesforce query failed',
-          details: data,
-        });
-      }
-
-      res.json({
+      return res.json({
         success: true,
         totalSize:
-          data.totalSize || 0,
+          result.totalSize || 0,
         records:
-          data.records || [],
+          result.records || [],
       });
     } catch (error) {
       console.error(
         'Department query failed:',
+      );
+
+      console.error(error);
+
+      return sendError(
+        res,
+        500,
+        'Failed to retrieve Department records',
+        error,
+      );
+    }
+  },
+);
+
+// ======================================================
+// GET SINGLE DEPARTMENT
+// ======================================================
+
+app.get(
+  '/api/departments/:id',
+  async (req, res) => {
+    try {
+      if (!connection) {
+        return sendError(
+          res,
+          500,
+          'Salesforce is not connected',
+        );
+      }
+
+      const {id} = req.params;
+
+      if (!id) {
+        return sendError(
+          res,
+          400,
+          'Department ID is required',
+        );
+      }
+
+      const result =
+        await connection
+          .sobject('Department__c')
+          .retrieve(id);
+
+      return res.json({
+        success: true,
+        record: result,
+      });
+    } catch (error) {
+      console.error(
+        'Get department failed:',
         error,
       );
 
-      res.status(500).json({
-        success: false,
-        message:
-          'Failed to retrieve Department records',
-        error: error.message,
-      });
+      return sendError(
+        res,
+        500,
+        'Failed to retrieve Department record',
+        error,
+      );
     }
   },
 );
@@ -440,100 +564,136 @@ app.post(
     );
 
     try {
-      if (!salesforce.accessToken) {
-        await connectToSalesforce();
+      // ------------------------------------------------
+      // Check Salesforce connection
+      // ------------------------------------------------
+
+      if (!connection) {
+        return sendError(
+          res,
+          500,
+          'Salesforce is not connected',
+        );
       }
 
-      if (!salesforce.accessToken) {
-        return res.status(500).json({
-          success: false,
-          message:
-            'Salesforce is not connected',
-        });
-      }
+      // ------------------------------------------------
+      // Request body
+      // ------------------------------------------------
 
       const {
         departmentName,
         dateJoined,
-      } = req.body;
+      } = req.body || {};
 
       console.log(
-        'Received:',
+        'Received Department data:',
         {
           departmentName,
           dateJoined,
         },
       );
 
+      // ------------------------------------------------
+      // Validate department name
+      // ------------------------------------------------
+
       if (
         !departmentName ||
+        typeof departmentName !== 'string' ||
         !departmentName.trim()
       ) {
-        return res.status(400).json({
-          success: false,
-          message:
-            'Department name is required',
-        });
+        return sendError(
+          res,
+          400,
+          'Department name is required',
+        );
       }
 
+      // ------------------------------------------------
+      // Validate date
+      // ------------------------------------------------
+
       if (!dateJoined) {
-        return res.status(400).json({
-          success: false,
-          message:
-            'Date joined is required',
-        });
+        return sendError(
+          res,
+          400,
+          'Date joined is required',
+        );
       }
+
+      // ------------------------------------------------
+      // Salesforce record
+      // ------------------------------------------------
 
       const record = {
         Name:
           departmentName.trim(),
+
         datejoined__c:
           dateJoined,
       };
 
-      const response =
-        await salesforceRequest(
-          'POST',
-          '/services/data/v67.0/sobjects/Department__c/',
-          record,
-        );
-
-      const data =
-        await response.json();
-
       console.log(
-        'Salesforce create response:',
-        data,
+        'Creating Salesforce record:',
+        record,
       );
 
-      if (!response.ok) {
-        return res.status(500).json({
-          success: false,
-          message:
-            data[0]?.message ||
-            'Failed to create Department record',
-          details: data,
-        });
+      // ------------------------------------------------
+      // Create record
+      // ------------------------------------------------
+
+      const result =
+        await connection
+          .sobject('Department__c')
+          .create(record);
+
+      console.log(
+        'Salesforce create result:',
+        result,
+      );
+
+      // ------------------------------------------------
+      // Check result
+      // ------------------------------------------------
+
+      if (!result.success) {
+        return res
+          .status(500)
+          .json({
+            success: false,
+            message:
+              'Failed to create Department record',
+            errors:
+              result.errors || [],
+          });
       }
 
-      res.status(201).json({
-        success: true,
-        message:
-          'Department created successfully',
-        id: data.id,
-      });
+      console.log(
+        'Department created successfully:',
+        result.id,
+      );
+
+      return res
+        .status(201)
+        .json({
+          success: true,
+          message:
+            'Department created successfully',
+          id: result.id,
+        });
     } catch (error) {
       console.error(
         'Department creation failed:',
-        error,
       );
 
-      res.status(500).json({
-        success: false,
-        message:
-          'Failed to create Department record',
-        error: error.message,
-      });
+      console.error(error);
+
+      return sendError(
+        res,
+        500,
+        'Failed to create Department record',
+        error,
+      );
     }
   },
 );
@@ -554,64 +714,96 @@ app.put(
     );
 
     console.log(
-      'ID:',
-      req.params.id,
-    );
-
-    console.log(
       '======================================',
     );
 
     try {
-      if (!salesforce.accessToken) {
-        await connectToSalesforce();
+      // ------------------------------------------------
+      // Check Salesforce connection
+      // ------------------------------------------------
+
+      if (!connection) {
+        return sendError(
+          res,
+          500,
+          'Salesforce is not connected',
+        );
       }
 
-      if (!salesforce.accessToken) {
-        return res.status(500).json({
-          success: false,
-          message:
-            'Salesforce is not connected',
-        });
-      }
+      // ------------------------------------------------
+      // Get ID
+      // ------------------------------------------------
 
       const {id} = req.params;
+
+      console.log(
+        'Updating Department:',
+        id,
+      );
+
+      if (!id) {
+        return sendError(
+          res,
+          400,
+          'Department ID is required',
+        );
+      }
+
+      // ------------------------------------------------
+      // Request body
+      // ------------------------------------------------
 
       const {
         departmentName,
         dateJoined,
-      } = req.body;
+      } = req.body || {};
 
-      if (!id) {
-        return res.status(400).json({
-          success: false,
-          message:
-            'Department ID is required',
-        });
-      }
+      console.log(
+        'Update data:',
+        {
+          departmentName,
+          dateJoined,
+        },
+      );
+
+      // ------------------------------------------------
+      // Validate name
+      // ------------------------------------------------
 
       if (
         !departmentName ||
+        typeof departmentName !== 'string' ||
         !departmentName.trim()
       ) {
-        return res.status(400).json({
-          success: false,
-          message:
-            'Department name is required',
-        });
+        return sendError(
+          res,
+          400,
+          'Department name is required',
+        );
       }
+
+      // ------------------------------------------------
+      // Validate date
+      // ------------------------------------------------
 
       if (!dateJoined) {
-        return res.status(400).json({
-          success: false,
-          message:
-            'Date joined is required',
-        });
+        return sendError(
+          res,
+          400,
+          'Date joined is required',
+        );
       }
 
+      // ------------------------------------------------
+      // Salesforce update record
+      // ------------------------------------------------
+
       const record = {
+        Id: id,
+
         Name:
           departmentName.trim(),
+
         datejoined__c:
           dateJoined,
       };
@@ -621,48 +813,42 @@ app.put(
         record,
       );
 
-      const response =
-        await salesforceRequest(
-          'PATCH',
-          `/services/data/v67.0/sobjects/Department__c/${id}`,
-          record,
-        );
+      // ------------------------------------------------
+      // Update
+      // ------------------------------------------------
 
-      const text =
-        await response.text();
+      const result =
+        await connection
+          .sobject('Department__c')
+          .update(record);
 
-      let data = {};
+      console.log(
+        'Salesforce update result:',
+        result,
+      );
 
-      try {
-        data = text
-          ? JSON.parse(text)
-          : {};
-      } catch {
-        data = {};
+      // ------------------------------------------------
+      // Check result
+      // ------------------------------------------------
+
+      if (!result.success) {
+        return res
+          .status(500)
+          .json({
+            success: false,
+            message:
+              'Failed to update Department record',
+            errors:
+              result.errors || [],
+          });
       }
 
       console.log(
-        'Salesforce update status:',
-        response.status,
+        'Department updated successfully:',
+        id,
       );
 
-      console.log(
-        'Salesforce update response:',
-        data,
-      );
-
-      if (!response.ok) {
-        return res.status(500).json({
-          success: false,
-          message:
-            data[0]?.message ||
-            data.message ||
-            'Failed to update Department record',
-          details: data,
-        });
-      }
-
-      res.json({
+      return res.json({
         success: true,
         message:
           'Department updated successfully',
@@ -671,15 +857,16 @@ app.put(
     } catch (error) {
       console.error(
         'Department update failed:',
-        error,
       );
 
-      res.status(500).json({
-        success: false,
-        message:
-          'Failed to update Department record',
-        error: error.message,
-      });
+      console.error(error);
+
+      return sendError(
+        res,
+        500,
+        'Failed to update Department record',
+        error,
+      );
     }
   },
 );
@@ -700,72 +887,77 @@ app.delete(
     );
 
     console.log(
-      'ID:',
-      req.params.id,
-    );
-
-    console.log(
       '======================================',
     );
 
     try {
-      if (!salesforce.accessToken) {
-        await connectToSalesforce();
+      // ------------------------------------------------
+      // Check Salesforce connection
+      // ------------------------------------------------
+
+      if (!connection) {
+        return sendError(
+          res,
+          500,
+          'Salesforce is not connected',
+        );
       }
 
-      if (!salesforce.accessToken) {
-        return res.status(500).json({
-          success: false,
-          message:
-            'Salesforce is not connected',
-        });
-      }
+      // ------------------------------------------------
+      // Get ID
+      // ------------------------------------------------
 
       const {id} = req.params;
 
+      console.log(
+        'Deleting Department:',
+        id,
+      );
+
       if (!id) {
-        return res.status(400).json({
-          success: false,
-          message:
-            'Department ID is required',
-        });
+        return sendError(
+          res,
+          400,
+          'Department ID is required',
+        );
       }
 
-      const response =
-        await salesforceRequest(
-          'DELETE',
-          `/services/data/v67.0/sobjects/Department__c/${id}`,
-        );
+      // ------------------------------------------------
+      // Delete
+      // ------------------------------------------------
 
-      const text =
-        await response.text();
+      const result =
+        await connection
+          .sobject('Department__c')
+          .destroy(id);
 
-      let data = {};
+      console.log(
+        'Salesforce delete result:',
+        result,
+      );
 
-      try {
-        data = text
-          ? JSON.parse(text)
-          : {};
-      } catch {
-        data = {};
+      // ------------------------------------------------
+      // Check result
+      // ------------------------------------------------
+
+      if (!result.success) {
+        return res
+          .status(500)
+          .json({
+            success: false,
+            message:
+              'Failed to delete Department record',
+            errors:
+              result.errors || [],
+          });
       }
 
       console.log(
-        'Salesforce delete status:',
-        response.status,
+        'Department deleted successfully:',
+        id,
       );
 
-      if (!response.ok) {
-        return res.status(500).json({
-          success: false,
-          message:
-            data[0]?.message ||
-            'Failed to delete Department record',
-          details: data,
-        });
-      }
-
-      res.json({
+      return res.json({
         success: true,
         message:
           'Department deleted successfully',
@@ -774,30 +966,55 @@ app.delete(
     } catch (error) {
       console.error(
         'Department deletion failed:',
-        error,
       );
 
-      res.status(500).json({
-        success: false,
-        message:
-          'Failed to delete Department record',
-        error: error.message,
-      });
+      console.error(error);
+
+      return sendError(
+        res,
+        500,
+        'Failed to delete Department record',
+        error,
+      );
     }
   },
 );
 
 // ======================================================
-// UNKNOWN API ROUTE
+// 404 HANDLER
 // ======================================================
 
 app.use(
-  '/api',
   (req, res) => {
     res.status(404).json({
       success: false,
       message:
-        `API route not found: ${req.method} ${req.originalUrl}`,
+        `Route not found: ${req.method} ${req.originalUrl}`,
+    });
+  },
+);
+
+// ======================================================
+// GLOBAL ERROR HANDLER
+// ======================================================
+
+app.use(
+  (error, req, res, next) => {
+    console.error(
+      'Unhandled server error:',
+      error,
+    );
+
+    if (res.headersSent) {
+      return next(error);
+    }
+
+    res.status(500).json({
+      success: false,
+      message:
+        'Internal server error',
+      error:
+        error.message || String(error),
     });
   },
 );
@@ -810,9 +1027,28 @@ app.listen(
   PORT,
   async () => {
     console.log(
+      '======================================',
+    );
+
+    console.log(
       `Backend server running on port ${PORT}`,
     );
 
-    await connectToSalesforce();
+    console.log(
+      '======================================',
+    );
+
+    const connected =
+      await connectToSalesforce();
+
+    if (!connected) {
+      console.error(
+        'WARNING: Salesforce connection failed.',
+      );
+
+      console.error(
+        'The server is running, but Salesforce API calls will fail.',
+      );
+    }
   },
 );
